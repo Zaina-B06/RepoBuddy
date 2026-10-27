@@ -4,3 +4,5 @@ tree-sitter-javascript
 tree-sitter-typescript
 pathspec
 requests
+fastapi
+uvicorn[standard]

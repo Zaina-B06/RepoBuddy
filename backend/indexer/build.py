@@ -73,6 +73,35 @@ def walk(root: Path) -> list[str]:
     return out
 
 
+_PY_DOC = re.compile(r'^\s*(?:#[^\n]*\n\s*)*[rRuU]?("""|\'\'\')(.*?)\1', re.S)
+_JS_BLOCK = re.compile(r"^\s*(?:(?:\"use \w+\";?|'use \w+';?)\s*)?/\*\*?(.*?)\*/", re.S)
+_JS_LINES = re.compile(r"^\s*((?://[^\n]*\n\s*)+)")
+
+
+def file_blurb(text: str, lang: str) -> str | None:
+    """The first sentence of a file's own top comment or docstring, if the author wrote one."""
+    head = text[:3000]
+    raw = None
+    if lang == "python":
+        m = _PY_DOC.match(head)
+        raw = m.group(2) if m else None
+    else:
+        m = _JS_BLOCK.match(head)
+        if m:
+            raw = re.sub(r"^\s*\*\s?", "", m.group(1), flags=re.M)
+        else:
+            m = _JS_LINES.match(head)
+            if m:
+                raw = re.sub(r"^\s*//\s?", "", m.group(1), flags=re.M)
+    if not raw:
+        return None
+    raw = " ".join(l.strip() for l in raw.strip().splitlines() if l.strip() and not l.strip().startswith(("@", "eslint", "prettier", "ts-", "#!")))
+    if len(raw) < 12 or raw.lower().startswith(("copyright", "license", "(c)", "eslint", "todo", "fixme", "hack", "xxx", "note:")):
+        return None
+    first = re.split(r"(?<=[.!?])\s", raw, maxsplit=1)[0]
+    return (first[:157] + "…") if len(first) > 160 else first
+
+
 def classify(path: str) -> str:
     if _TEST.search(path):
         return "test"
@@ -127,6 +156,10 @@ def build_index(root: Path, db_path: Path | None = None, progress=print) -> Path
     root = root.resolve()
     db_path = db_path or db_path_for(root)
     db = store.connect(db_path)
+    if "blurb" not in [r[1] for r in db.execute("PRAGMA table_info(files)")]:
+        db.close()
+        db_path.unlink()
+        db = store.connect(db_path)
 
     # keep summaries whose file content has not changed (the "hash cache")
     old_summaries = {r["path"]: (r["summary"], r["summary_sha1"]) for r in
@@ -168,9 +201,10 @@ def build_index(root: Path, db_path: Path | None = None, progress=print) -> Path
         if summary_sha != sha:
             summary, summary_sha = None, None
         loc = raw.count(b"\n") + (0 if raw.endswith(b"\n") or not raw else 1)
-        db.execute("INSERT INTO files (path, folder, lang, size, loc, sha1, kind, is_entry, summary, summary_sha1)"
-                   " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                   (p, posixpath.dirname(p), info.lang, len(raw), loc, sha, kind, int(is_entry), summary, summary_sha))
+        blurb = file_blurb(raw.decode("utf8", errors="replace"), info.lang)
+        db.execute("INSERT INTO files (path, folder, lang, size, loc, sha1, kind, is_entry, summary, summary_sha1, blurb)"
+                   " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                   (p, posixpath.dirname(p), info.lang, len(raw), loc, sha, kind, int(is_entry), summary, summary_sha, blurb))
         db.executemany("INSERT INTO symbols (file, name, kind, start_line, end_line, exported) VALUES (?,?,?,?,?,?)",
                        [(p, s.name, s.kind, s.start, s.end, int(s.exported)) for s in info.symbols])
         # tests call routes (supertest, test clients); they don't define the app's API

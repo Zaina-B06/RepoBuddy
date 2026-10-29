@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS files (
     rank REAL DEFAULT 0,          -- PageRank over imports, test files excluded
     in_degree INTEGER DEFAULT 0,  -- imported by how many non-test files
     summary TEXT,
-    summary_sha1 TEXT             -- sha1 the summary was written for (cache key)
+    summary_sha1 TEXT,            -- sha1 the summary was written for (cache key)
+    blurb TEXT                    -- the file's own top comment or docstring, if it has one
 );
 
 CREATE TABLE IF NOT EXISTS symbols (
@@ -61,10 +62,15 @@ CREATE TABLE IF NOT EXISTS unresolved (
 """
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
-    db = sqlite3.connect(db_path)
+def connect(db_path: Path, readonly: bool = False) -> sqlite3.Connection:
+    """Open the map database. Readers use read-only mode, so they never block the indexer
+    (on Windows, two connections writing at once caused "database is locked" errors)."""
+    if readonly:
+        db = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True, timeout=10, check_same_thread=False)
+    else:
+        db = sqlite3.connect(db_path, timeout=10)
+        db.executescript(SCHEMA)
     db.row_factory = sqlite3.Row
-    db.executescript(SCHEMA)
     return db
 
 
@@ -85,6 +91,24 @@ def _child_of(folder: str, path: str) -> str | None:
     return prefix + first
 
 
+def _file_details(db: sqlite3.Connection, paths: list[str]) -> dict[str, dict]:
+    """What each file defines: its main functions/classes and any API routes. Used for hover cards."""
+    out: dict[str, dict] = {p: {"defines": [], "routes": []} for p in paths}
+    if not paths:
+        return out
+    marks = ",".join("?" * len(paths))
+    for r in db.execute(f"SELECT file, name, kind, exported FROM symbols WHERE file IN ({marks}) AND kind != 'method'"
+                        " ORDER BY exported DESC, start_line", paths):
+        d = out[r["file"]]["defines"]
+        if len(d) < 5 and r["name"] not in d:
+            d.append(r["name"])
+    for r in db.execute(f"SELECT file, method, path FROM routes WHERE file IN ({marks})", paths):
+        rt = out[r["file"]]["routes"]
+        if len(rt) < 4:
+            rt.append(f"{r['method']} {r['path']}")
+    return out
+
+
 def folder_view(db: sqlite3.Connection, folder: str = "", include_tests: bool = False) -> dict:
     """Nodes = immediate subfolders + files in `folder`; edges = imports between them, aggregated.
 
@@ -93,14 +117,19 @@ def folder_view(db: sqlite3.Connection, folder: str = "", include_tests: bool = 
     nodes = []
     for r in db.execute("SELECT path, file_count, loc, summary FROM folders WHERE parent = ? AND path != ''"
                         " ORDER BY loc DESC", (folder,)):
+        top = [t["path"].split("/")[-1] for t in db.execute(
+            "SELECT path FROM files WHERE (path LIKE ? || '/%') AND kind != 'test' ORDER BY rank DESC LIMIT 3", (r["path"],))]
         nodes.append({"id": r["path"], "type": "folder", "name": r["path"].split("/")[-1],
-                      "files": r["file_count"], "loc": r["loc"], "summary": r["summary"]})
+                      "files": r["file_count"], "loc": r["loc"], "summary": r["summary"], "key_files": top})
     kind_filter = "" if include_tests else " AND kind != 'test'"
-    for r in db.execute("SELECT path, loc, kind, is_entry, rank, in_degree, summary FROM files"
-                        f" WHERE folder = ?{kind_filter} ORDER BY path", (folder,)):
+    rows = db.execute("SELECT path, loc, kind, is_entry, rank, in_degree, summary, blurb FROM files"
+                      f" WHERE folder = ?{kind_filter} ORDER BY path", (folder,)).fetchall()
+    details = _file_details(db, [r["path"] for r in rows])
+    for r in rows:
         nodes.append({"id": r["path"], "type": "file", "name": r["path"].split("/")[-1],
                       "loc": r["loc"], "kind": r["kind"], "entry": bool(r["is_entry"]),
-                      "rank": r["rank"], "in_degree": r["in_degree"], "summary": r["summary"]})
+                      "rank": r["rank"], "in_degree": r["in_degree"], "summary": r["summary"],
+                      "blurb": r["blurb"], **details[r["path"]]})
     if not include_tests:
         # hide folders that contain only tests
         has_code = {r["folder"] for r in db.execute("SELECT DISTINCT folder FROM files WHERE kind != 'test'")}
@@ -126,10 +155,13 @@ def file_graph(db: sqlite3.Connection, include_tests: bool = False) -> dict:
     """Every file and every edge: the Connections view (F3)."""
     kind_filter = "" if include_tests else " WHERE kind != 'test'"
     nodes = [dict(r) for r in db.execute(
-        f"SELECT path AS id, folder, lang, loc, kind, is_entry, rank, in_degree FROM files{kind_filter}")]
+        f"SELECT path AS id, folder, lang, loc, kind, is_entry, rank, in_degree, summary, blurb FROM files{kind_filter}")]
+    details = _file_details(db, [n["id"] for n in nodes])
+    for n in nodes:
+        n.update(details[n["id"]])
     ids = {n["id"] for n in nodes}
     edges = [dict(r) for r in db.execute("SELECT src AS source, dst AS target, kind, confidence FROM edges")
-             if r["src"] in ids and r["dst"] in ids]
+             if r["source"] in ids and r["target"] in ids]
     return {"nodes": nodes, "edges": edges}
 
 
